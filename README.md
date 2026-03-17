@@ -675,7 +675,3 @@ make clean      # Stop and remove volumes
 MIT License — see [LICENSE](LICENSE) for details.
 
 ---
-
-<div align="center">
-Built at IIIT SriCity · Data Team
-</div>
