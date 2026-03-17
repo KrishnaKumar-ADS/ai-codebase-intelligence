@@ -1,0 +1,35 @@
+# ── API Framework ─────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.6
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+
+# ── Database ──────────────────────────────────────────────────
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+psycopg2-binary==2.9.10
+
+# ── Task Queue ────────────────────────────────────────────────
+celery==5.4.0
+redis==5.2.1
+
+# ── Repository Ingestion ──────────────────────────────────────
+gitpython==3.1.43
+
+# ── LLM Providers ─────────────────────────────────────────────
+google-generativeai==0.8.3
+openai==1.58.1
+
+# ── Utilities ─────────────────────────────────────────────────
+httpx==0.28.1
+tenacity==9.0.0
+structlog==25.1.0
+python-multipart==0.0.20
+
+# ── Testing ───────────────────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.25.2
+pytest-cov==6.0.0
+respx==0.21.1
