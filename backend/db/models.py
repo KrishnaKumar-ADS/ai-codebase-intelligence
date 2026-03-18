@@ -57,12 +57,18 @@ class CodeChunk(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     source_file_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("source_files.id"), nullable=False)
-    chunk_type: Mapped[str] = mapped_column(String(50), nullable=False)   # function, class, module
+    chunk_type: Mapped[str] = mapped_column(String(50), nullable=False)
     name: Mapped[str] = mapped_column(String(300), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     start_line: Mapped[int] = mapped_column(Integer, default=0)
     end_line: Mapped[int] = mapped_column(Integer, default=0)
-    qdrant_point_id: Mapped[str | None] = mapped_column(String(200), nullable=True)  # Qdrant vector ID
+
+    # ── New fields added in Week 2 ────────────────────────────
+    docstring: Mapped[str] = mapped_column(Text, default="")
+    parent_name: Mapped[str] = mapped_column(String(300), default="")
+    display_name: Mapped[str] = mapped_column(String(600), default="")
+
+    qdrant_point_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     source_file: Mapped["SourceFile"] = relationship("SourceFile", back_populates="chunks")

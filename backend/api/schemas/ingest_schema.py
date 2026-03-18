@@ -28,3 +28,7 @@ class StatusResponse(BaseModel):
     message: str
     repo_id: str | None = None
     error: str | None = None
+    # ── New in Week 2 ─────────────────────────
+    total_files: int = 0
+    processed_files: int = 0
+    total_chunks: int = 0

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
+from db.models import Repository, SourceFile, CodeChunk, IngestionStatus
 import uuid
 
 from db.database import get_db
@@ -53,15 +54,34 @@ async def ingest_repository(request: IngestRequest, db: AsyncSession = Depends(g
 async def get_task_status(task_id: str, db: AsyncSession = Depends(get_db)):
     from celery.result import AsyncResult
     from tasks.celery_app import celery_app
+    from sqlalchemy import func
 
     result = AsyncResult(task_id, app=celery_app)
-    repo_result = await db.execute(select(Repository).where(Repository.task_id == task_id))
+
+    # ── Query 1: get repo record ──────────────────────────
+    repo_result = await db.execute(
+        select(Repository).where(Repository.task_id == task_id)
+    )
     repo = repo_result.scalar_one_or_none()
 
     if repo is None and result.state == "PENDING":
         raise HTTPException(status_code=404, detail="Task not found.")
 
     meta = result.info or {}
+
+    # ── Query 2: count chunks — use fresh session ─────────
+    total_chunks = 0
+    if repo:
+        # Flush and expire before second query to avoid asyncpg conflict
+        await db.commit()
+
+        chunk_result = await db.execute(
+            select(func.count(CodeChunk.id))
+            .join(SourceFile, CodeChunk.source_file_id == SourceFile.id)
+            .where(SourceFile.repository_id == repo.id)
+        )
+        total_chunks = chunk_result.scalar() or 0
+
     return StatusResponse(
         task_id=task_id,
         status=repo.status.value if repo else result.state.lower(),
@@ -69,4 +89,7 @@ async def get_task_status(task_id: str, db: AsyncSession = Depends(get_db)):
         message=meta.get("message", "") if isinstance(meta, dict) else "",
         repo_id=str(repo.id) if repo else None,
         error=str(meta) if result.state == "FAILURE" else None,
+        total_files=repo.total_files if repo else 0,
+        processed_files=repo.processed_files if repo else 0,
+        total_chunks=total_chunks,
     )
