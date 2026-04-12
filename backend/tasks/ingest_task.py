@@ -1,7 +1,15 @@
 """
 Ingestion Task — full pipeline from GitHub URL to stored chunks.
-"""
 
+Pipeline stages:
+  1. Clone     → GitPython clones the repo to data/raw/{repo_id}/
+  2. Scan      → file_scanner finds all source files
+  3. Parse     → metadata_extractor extracts functions/classes/chunks → PostgreSQL
+  4. Embed     → embedding_pipeline embeds all chunks → Qdrant
+  5. Graph     → graph_builder builds call graph → Neo4j   (non-fatal if it fails)
+  6. Complete  → status set to COMPLETED
+"""
+import asyncio
 import sys
 import os
 from pathlib import Path
@@ -11,10 +19,14 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from tasks.celery_app import celery_app
+from db.database import AsyncSessionLocal as PgAsyncSessionLocal
 from db.models import Repository, SourceFile, CodeChunk, IngestionStatus
 from ingestion.repo_loader import clone_repository
 from ingestion.file_scanner import scan_repository, ScannedFile
 from parsing.metadata_extractor import extract_metadata
+from graphs.graph_builder import build_repo_graph
+from graphs.neo4j_writer import write_graph_to_neo4j, delete_repo_graph
+from graphs.schema import create_indexes
 from core.config import get_settings
 from core.exceptions import RepoNotFoundError
 
@@ -23,7 +35,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-logger = get_task_logger(__name__)
+logger   = get_task_logger(__name__)
 settings = get_settings()
 
 sync_engine = create_engine(
@@ -39,8 +51,12 @@ SyncSessionLocal = sessionmaker(
 )
 
 
-# ✅ FIX 1: Define missing function
-def _update_state(task, progress: int, message: str):
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _update_state(task, progress: int, message: str) -> None:
+    """Push a progress update to Celery's result backend."""
     task.update_state(
         state="STARTED",
         meta={"progress": progress, "message": message},
@@ -53,7 +69,8 @@ def _set_status(
     total_files: int = 0,
     processed_files: int = 0,
     error: str | None = None,
-):
+) -> None:
+    """Write a status update for the repo row in PostgreSQL."""
     with SyncSessionLocal() as session:
         repo = session.execute(
             select(Repository).where(Repository.id == repo_id)
@@ -77,6 +94,7 @@ def _set_status(
 
 
 def _store_file_and_chunks(repo_id: str, scanned: ScannedFile, chunks: list) -> int:
+    """Persist one scanned file and all its extracted chunks to PostgreSQL."""
     with SyncSessionLocal() as session:
         source_file = SourceFile(
             repository_id=repo_id,
@@ -108,6 +126,10 @@ def _store_file_and_chunks(repo_id: str, scanned: ScannedFile, chunks: list) -> 
         return len(chunks)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Task
+# ─────────────────────────────────────────────────────────────────────────────
+
 @celery_app.task(
     bind=True,
     name="tasks.ingest_task.run_ingestion_task",
@@ -118,31 +140,31 @@ def run_ingestion_task(self, repo_id: str, github_url: str, branch: str = "main"
     logger.info(f"[{repo_id}] Starting ingestion pipeline")
 
     try:
-        # ── Stage 1: Clone ─────────────────────────────
+        # ── Stage 1: Clone ────────────────────────────────────────────────────
         _update_state(self, 5, "Cloning repository...")
         _set_status(repo_id, IngestionStatus.CLONING)
 
         repo_path = clone_repository(github_url, repo_id, branch)
         logger.info(f"[{repo_id}] Cloned to {repo_path}")
 
-        # ── Stage 2: Scan ─────────────────────────────
+        # ── Stage 2: Scan ─────────────────────────────────────────────────────
         _update_state(self, 20, "Scanning source files...")
         _set_status(repo_id, IngestionStatus.SCANNING)
 
         scanned_files = scan_repository(repo_path)
-        total_files = len(scanned_files)
+        total_files   = len(scanned_files)
 
         logger.info(f"[{repo_id}] Found {total_files} files")
 
         if total_files == 0:
             _set_status(repo_id, IngestionStatus.COMPLETED)
             return {
-                "repo_id": repo_id,
-                "total_files": 0,
+                "repo_id":      repo_id,
+                "total_files":  0,
                 "total_chunks": 0,
             }
 
-        # ── Stage 3: Parse + Store ─────────────────────
+        # ── Stage 3: Parse + Store ────────────────────────────────────────────
         _update_state(self, 30, f"Parsing {total_files} files...")
         _set_status(repo_id, IngestionStatus.PARSING)
 
@@ -154,7 +176,7 @@ def run_ingestion_task(self, repo_id: str, github_url: str, branch: str = "main"
                 _update_state(
                     self,
                     progress,
-                    f"Parsing {i+1}/{total_files}: {scanned.relative_path}",
+                    f"Parsing {i + 1}/{total_files}: {scanned.relative_path}",
                 )
 
             try:
@@ -171,37 +193,38 @@ def run_ingestion_task(self, repo_id: str, github_url: str, branch: str = "main"
 
         logger.info(f"[{repo_id}] Stored {total_chunks} chunks")
 
-        # ── Stage 4: Embedding ─────────────────────────
+        # ── Stage 4: Embedding ────────────────────────────────────────────────
         _update_state(self, 65, f"Embedding {total_chunks} chunks...")
         _set_status(repo_id, IngestionStatus.EMBEDDING)
 
-        total_embedded = 0
+        total_embedded  = 0
         embedding_error: str | None = None
 
         try:
-            # Guard against worker runtime CWD/sys.path drift before dynamic import.
+            # Guard against worker runtime CWD / sys.path drift before dynamic import.
             os.chdir(str(BACKEND_ROOT))
             if str(BACKEND_ROOT) not in sys.path:
                 sys.path.insert(0, str(BACKEND_ROOT))
+
             from embeddings.embedding_pipeline import embed_repository
 
-            def embedding_progress(done, chunk_total, message):
+            def _embedding_progress(done: int, chunk_total: int, message: str) -> None:
                 if chunk_total > 0:
-                    progress = 65 + int((done / chunk_total) * 30)
+                    progress = 65 + int((done / chunk_total) * 20)   # 65 → 85
                     _update_state(self, progress, message)
 
             result = embed_repository(
                 repo_id=repo_id,
-                progress_callback=embedding_progress,
+                progress_callback=_embedding_progress,
             )
 
             total_embedded = result.get("embedded", 0)
 
-            attempted_chunks = result.get("total_chunks", total_chunks) - result.get("already_embedded", 0)
-            if attempted_chunks > 0 and total_embedded == 0:
+            attempted = result.get("total_chunks", total_chunks) - result.get("already_embedded", 0)
+            if attempted > 0 and total_embedded == 0:
                 embedding_error = (
                     "Embedding produced 0 vectors. "
-                    "Check Gemini embedding model/API key and Qdrant connectivity."
+                    "Check Gemini embedding model / API key and Qdrant connectivity."
                 )
             elif result.get("failed", 0) > 0:
                 logger.warning(
@@ -224,17 +247,64 @@ def run_ingestion_task(self, repo_id: str, github_url: str, branch: str = "main"
             )
             _update_state(self, 100, failure_message)
             return {
-                "repo_id": repo_id,
-                "status": "failed",
-                "error": embedding_error,
-                "progress": 100,
-                "message": failure_message,
-                "total_files": total_files,
-                "total_chunks": total_chunks,
+                "repo_id":        repo_id,
+                "status":         "failed",
+                "error":          embedding_error,
+                "progress":       100,
+                "message":        failure_message,
+                "total_files":    total_files,
+                "total_chunks":   total_chunks,
                 "total_embedded": total_embedded,
             }
 
-        # ── Done ───────────────────────────────────────
+        # ── Stage 5: Graph Building ───────────────────────────────────────────
+        # Non-fatal: if the graph build fails the repo is still fully searchable
+        # via Qdrant vector search. We log the error and proceed to completion.
+        _update_state(self, 88, "Building call graph in Neo4j...")
+        logger.info(f"[{repo_id}] Graph stage start")
+
+        graph_stats: dict = {}
+
+        try:
+            # Create Neo4j indexes on first run (idempotent).
+            create_indexes()
+
+            # Delete any existing graph for this repo (handles re-ingestion).
+            delete_repo_graph(repo_id)
+
+            # Build the in-memory graph from PostgreSQL using an async DB session.
+            async def _build_repo_graph_async() -> object:
+                async with PgAsyncSessionLocal() as async_db:
+                    return await build_repo_graph(repo_id, async_db)
+
+            repo_graph = asyncio.run(_build_repo_graph_async())
+
+            # Write nodes first, then edges.
+            graph_stats = write_graph_to_neo4j(repo_graph)
+
+            logger.info(
+                f"[{repo_id}] Graph complete — "
+                f"nodes={graph_stats.get('nodes_written', 0)}, "
+                f"edges={graph_stats.get('edges_written', 0)}, "
+                f"calls={graph_stats.get('calls_edges', 0)}"
+            )
+
+            _update_state(
+                self,
+                95,
+                f"Graph built — "
+                f"{graph_stats.get('function_nodes', 0)} functions, "
+                f"{graph_stats.get('calls_edges', 0)} call edges.",
+            )
+
+        except Exception as graph_err:
+            logger.error(
+                f"[{repo_id}] Graph build failed (non-fatal): {graph_err}",
+                exc_info=True,
+            )
+            # Do NOT return or raise here — fall through to completion.
+
+        # ── Stage 6: Complete ─────────────────────────────────────────────────
         _set_status(
             repo_id,
             IngestionStatus.COMPLETED,
@@ -242,24 +312,28 @@ def run_ingestion_task(self, repo_id: str, github_url: str, branch: str = "main"
             processed_files=total_files,
         )
 
-        _update_state(
-            self,
-            100,
-            f"Done: {total_files} files, {total_chunks} chunks, {total_embedded} embedded",
+        completion_message = (
+            f"Done — {total_files} files, "
+            f"{total_chunks} chunks, "
+            f"{total_embedded} embedded, "
+            f"{graph_stats.get('function_nodes', 0)} functions in graph."
         )
 
+        _update_state(self, 100, completion_message)
         logger.info(f"[{repo_id}] Pipeline completed")
 
         return {
-            "repo_id": repo_id,
-            "total_files": total_files,
-            "total_chunks": total_chunks,
+            "repo_id":        repo_id,
+            "status":         "completed",
+            "total_files":    total_files,
+            "total_chunks":   total_chunks,
             "total_embedded": total_embedded,
+            "graph_stats":    graph_stats,
         }
 
     except RepoNotFoundError as e:
         logger.error(f"[{repo_id}] Repo not found: {e}")
-        raise
+        raise   # Re-raise directly — no retry for a missing repo row.
 
     except Exception as e:
         logger.error(f"[{repo_id}] FAILED: {e}")
@@ -267,6 +341,9 @@ def run_ingestion_task(self, repo_id: str, github_url: str, branch: str = "main"
         try:
             _set_status(repo_id, IngestionStatus.FAILED, error=str(e))
         except Exception:
-            logger.error(f"[{repo_id}] Failed to update status")
+            logger.error(f"[{repo_id}] Could not update failure status")
 
         raise self.retry(exc=e)
+        # NOTE: raise self.retry() terminates this call by raising Retry.
+        # Nothing after this line runs. Keep this as the absolute last statement
+        # in the except block.

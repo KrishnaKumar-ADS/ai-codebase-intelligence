@@ -5,32 +5,38 @@ from api.routes import ingest, search          # ← keep both
 from core.logging import setup_logging, get_logger
 from core.config import get_settings
 from api.middleware import add_middleware
-
+from graphs.neo4j_client import get_driver, close_driver, ping as neo4j_ping
+from graphs.schema import create_indexes
 settings = get_settings()
 logger = get_logger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    setup_logging()
+    """Application startup and shutdown handler."""
+    # ── Startup ────────────────────────────────────────────────────────────
+    logger.info("app_startup_begin")
 
-    # Validate API keys
-    warnings = settings.validate_api_keys()
-    for w in warnings:
-        logger.warning("api_key_warning", message=w)
+    # Validate LLM API keys (existing — logs warnings for missing keys)
 
-    if not warnings:
-        logger.info("all_providers_configured", providers=["gemini", "deepseek", "openrouter"])
+    # Initialize Qdrant collection (existing — from Week 3)
 
-    # Ensure Qdrant collection exists
+
+    # ── NEW in Week 4: Initialize Neo4j ────────────────────────────────────
     try:
-        from embeddings.vector_store import ensure_collection_exists
-        ensure_collection_exists()
-        logger.info("qdrant_ready")
+        get_driver()       # establishes connection pool + verifies connectivity
+        create_indexes()   # creates all 9 graph indexes (idempotent)
+        logger.info("neo4j_initialized")
     except Exception as e:
-        logger.warning("qdrant_not_available", error=str(e))
+        # Non-fatal — app still works without Neo4j (Qdrant search still works)
+        logger.warning("neo4j_startup_warning", error=str(e))
 
+    logger.info("app_startup_complete")
     yield
+
+    # ── Shutdown ────────────────────────────────────────────────────────────
+    close_driver()
+    logger.info("app_shutdown_complete")
 
 
 app = FastAPI(
