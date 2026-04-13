@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     deepseek_api_key: str = ""
     openrouter_api_key: str = ""
+    qwen_api_key: str = ""
 
     # ── LLM Routing ──────────────────────────────────────
     llm_code_model: str = "deepseek-coder"
@@ -30,6 +31,7 @@ class Settings(BaseSettings):
 
     # ── Redis ─────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
+    daily_budget_usd: float = 5.0
 
     # ── Qdrant ───────────────────────────────────────────
     qdrant_host: str = "localhost"
@@ -39,6 +41,9 @@ class Settings(BaseSettings):
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "neo4j_password"
+
+    # ── Webhook ──────────────────────────────────────────
+    webhook_secret: str = ""
 
     @property
     def database_url(self) -> str:
@@ -76,6 +81,8 @@ class Settings(BaseSettings):
             warnings.append("DEEPSEEK_API_KEY not set — code-specific reasoning will use Gemini fallback.")
         if not self.openrouter_api_key:
             warnings.append("OPENROUTER_API_KEY not set — fallback provider disabled.")
+        if not self.qwen_api_key:
+            warnings.append("QWEN_API_KEY not set — direct Qwen query expansion fallback disabled.")
         return warnings
 
     class Config:
