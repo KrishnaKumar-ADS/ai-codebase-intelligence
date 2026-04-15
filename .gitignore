@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.prod
 .coverage
 .coverage.*
 
@@ -19,6 +20,8 @@ frontend/.env.local
 
 # Docker
 docker-compose.override.yml
+docker/nginx/certs/*.key
+docker/nginx/certs/*.crt
 
 # IDE
 .vscode/

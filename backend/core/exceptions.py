@@ -25,3 +25,8 @@ class LLMProviderError(AppError):
 class EmbeddingError(AppError):
     """Embedding generation failed."""
     pass
+
+
+class ChunkNotFoundError(AppError):
+    """Requested code chunk could not be found."""
+    pass

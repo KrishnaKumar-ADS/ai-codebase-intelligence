@@ -1,103 +1,166 @@
-"""
-Google Gemini client — handles both chat completions and embeddings.
-Uses tenacity for automatic retry on rate limit errors.
-"""
+"""Gemini generation client used by the Week 6 reasoning pipeline."""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from typing import AsyncIterator
 
 import google.generativeai as genai
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+
 from core.config import get_settings
+from core.exceptions import LLMProviderError
 from core.logging import get_logger
-from core.exceptions import LLMProviderError, EmbeddingError
 
 logger = get_logger(__name__)
 settings = get_settings()
 
 
-def _get_client():
-    genai.configure(api_key=settings.gemini_api_key)
-    return genai
+GEMINI_FLASH = "gemini-2.0-flash"
+GEMINI_PRO = "gemini-1.5-pro"
+DEFAULT_MODEL = GEMINI_FLASH
+
+DEFAULT_TEMPERATURE = 0.3
+DEFAULT_MAX_TOKENS = 4096
 
 
-@retry(
-    retry=retry_if_exception_type(Exception),
-    wait=wait_exponential(multiplier=1, min=2, max=30),
-    stop=stop_after_attempt(3),
-)
-def generate(
-    prompt: str,
-    system_prompt: str = "",
-    model: str = "gemini-2.5-flash",
-    max_tokens: int = 4096,
-    temperature: float = 0.1,
-) -> str:
-    """
-    Generate a text completion using Gemini.
-    Automatically retries up to 3 times with exponential backoff.
-    """
-    try:
-        _get_client()
-        generation_config = genai.GenerationConfig(
-            max_output_tokens=max_tokens,
-            temperature=temperature,
+class GeminiChatClient:
+    """Async-friendly wrapper around the synchronous Gemini SDK."""
+
+    def __init__(self, model: str = DEFAULT_MODEL) -> None:
+        if not settings.gemini_api_key:
+            raise LLMProviderError("GEMINI_API_KEY is not set.")
+
+        genai.configure(api_key=settings.gemini_api_key)
+        self._model_name = model
+        self._model = genai.GenerativeModel(model)
+
+    async def complete(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> str:
+        """Generate a complete response as a single string."""
+        try:
+            return await asyncio.to_thread(
+                self._complete_with_retry,
+                prompt,
+                system_prompt,
+                temperature,
+                max_tokens,
+            )
+        except LLMProviderError:
+            raise
+        except Exception as exc:
+            logger.error("gemini_complete_failed", error=str(exc), model=self._model_name)
+            raise LLMProviderError(f"Gemini generation failed: {exc}") from exc
+
+    async def stream_complete(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> AsyncIterator[str]:
+        """Yield incremental response chunks from Gemini."""
+        queue: asyncio.Queue = asyncio.Queue()
+        done = object()
+        loop = asyncio.get_running_loop()
+
+        def _producer() -> None:
+            try:
+                contents = self._build_contents(prompt, system_prompt)
+                config = self._build_generation_config(temperature, max_tokens)
+
+                stream = self._model.generate_content(
+                    contents=contents,
+                    generation_config=config,
+                    stream=True,
+                )
+                for chunk in stream:
+                    text = getattr(chunk, "text", None)
+                    if text:
+                        loop.call_soon_threadsafe(queue.put_nowait, text)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, LLMProviderError(str(exc)))
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, done)
+
+        threading.Thread(target=_producer, daemon=True).start()
+
+        while True:
+            item = await queue.get()
+            if item is done:
+                break
+            if isinstance(item, Exception):
+                raise LLMProviderError(f"Gemini streaming failed: {item}")
+            yield item
+
+    def estimate_tokens(self, text: str) -> int:
+        """Best-effort token estimate for context budgeting."""
+        try:
+            import tiktoken
+
+            return len(tiktoken.get_encoding("cl100k_base").encode(text))
+        except Exception:
+            return len(text) // 4
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    @property
+    def context_window_tokens(self) -> int:
+        limits = {
+            GEMINI_FLASH: 1_048_576,
+            GEMINI_PRO: 2_097_152,
+        }
+        return limits.get(self._model_name, 1_048_576)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception(lambda exc: not isinstance(exc, LLMProviderError)),
+    )
+    def _complete_with_retry(
+        self,
+        prompt: str,
+        system_prompt: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        contents = self._build_contents(prompt, system_prompt)
+        config = self._build_generation_config(temperature, max_tokens)
+        response = self._model.generate_content(
+            contents=contents,
+            generation_config=config,
         )
 
-        gemini_model = genai.GenerativeModel(
-            model_name=model,
-            generation_config=generation_config,
-            system_instruction=system_prompt if system_prompt else None,
-        )
-
-        response = gemini_model.generate_content(prompt)
-        text = response.text
-        logger.debug("gemini_response", model=model, tokens=len(text.split()))
+        text = getattr(response, "text", "")
+        if not text:
+            raise LLMProviderError("Gemini returned an empty response.")
         return text
 
-    except Exception as e:
-        logger.error("gemini_generate_failed", error=str(e), model=model)
-        raise LLMProviderError(f"Gemini generation failed: {e}") from e
+    @staticmethod
+    def _build_contents(prompt: str, system_prompt: str) -> list[dict]:
+        if system_prompt:
+            return [
+                {"role": "user", "parts": [{"text": system_prompt}]},
+                {"role": "model", "parts": [{"text": "Understood."}]},
+                {"role": "user", "parts": [{"text": prompt}]},
+            ]
+        return [{"role": "user", "parts": [{"text": prompt}]}]
 
-
-@retry(
-    retry=retry_if_exception_type(Exception),
-    wait=wait_exponential(multiplier=1, min=2, max=30),
-    stop=stop_after_attempt(3),
-)
-def embed(text: str, model: str | None = None) -> list[float]:
-    """
-    Generate a single embedding vector using Gemini embedding models.
-    Automatically retries on rate limit errors.
-    """
-    try:
-        _get_client()
-        resolved_model = model or settings.resolved_embedding_model
-        result = genai.embed_content(
-            model=resolved_model,
-            content=text,
-            task_type="retrieval_document",
-            output_dimensionality=settings.embedding_vector_dim,
+    @staticmethod
+    def _build_generation_config(
+        temperature: float,
+        max_tokens: int,
+    ) -> genai.types.GenerationConfig:
+        return genai.types.GenerationConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+            candidate_count=1,
         )
-        return result["embedding"]
-
-    except Exception as e:
-        logger.error("gemini_embed_failed", error=str(e))
-        raise EmbeddingError(f"Gemini embedding failed: {e}") from e
-
-
-def embed_batch(texts: list[str], model: str | None = None) -> list[list[float]]:
-    """
-    Embed a list of texts. Gemini free tier allows 100 req/min,
-    so we process with a small delay between batches.
-    """
-    import time
-    embeddings = []
-    batch_size = 20  # Stay safely within rate limits
-
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        for text in batch:
-            embeddings.append(embed(text, model=model))
-        if i + batch_size < len(texts):
-            time.sleep(0.8)  # ~75 req/min safely under 100/min limit
-        logger.info("embed_batch_progress", done=min(i + batch_size, len(texts)), total=len(texts))
-
-    return embeddings

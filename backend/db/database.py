@@ -9,6 +9,8 @@ engine = create_async_engine(
     echo=settings.app_env == "development",
     pool_size=10,
     max_overflow=20,
+    pool_pre_ping=True,
+    pool_recycle=1800,
 )
 
 AsyncSessionLocal = async_sessionmaker(

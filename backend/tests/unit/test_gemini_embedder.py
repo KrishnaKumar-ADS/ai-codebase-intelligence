@@ -6,7 +6,8 @@ and make no network requests.
 """
 
 import pytest
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
+import embeddings.gemini_embedder as gemini_embedder
 from embeddings.gemini_embedder import (
     embed_text,
     embed_query,
@@ -137,12 +138,39 @@ def test_embed_text_raises_for_blank_string(mock_config):
         embed_text("    ")
 
 
+@patch("embeddings.gemini_embedder.genai.embed_content", side_effect=Exception("429 quota exceeded"))
+@patch("embeddings.gemini_embedder._configure_genai")
+def test_embed_text_falls_back_on_quota_error(mock_config, mock_embed):
+    with patch.object(gemini_embedder.settings, "embedding_allow_local_fallback", True):
+        vector = embed_text("def hello(): pass")
+    assert len(vector) == VECTOR_DIMENSIONS
+    assert any(v != 0.0 for v in vector)
+
+
+@patch("embeddings.gemini_embedder._configure_genai", side_effect=EmbeddingError("api key missing"))
+def test_embed_text_falls_back_on_provider_config_error(mock_config):
+    with patch.object(gemini_embedder.settings, "embedding_allow_local_fallback", True):
+        vector = embed_text("def hello(): pass")
+    assert len(vector) == VECTOR_DIMENSIONS
+
+
+@patch("embeddings.gemini_embedder._configure_genai", side_effect=EmbeddingError("api key missing"))
+def test_embed_text_raises_when_fallback_disabled(mock_config):
+    with patch.object(gemini_embedder.settings, "embedding_allow_local_fallback", False):
+        with pytest.raises(EmbeddingError, match="api key"):
+            embed_text("def hello(): pass")
+
+
 # ── embed_query tests ─────────────────────────────────────────────────────────
 
 @patch("embeddings.gemini_embedder.genai.embed_content", side_effect=_fake_embed)
 @patch("embeddings.gemini_embedder._configure_genai")
 def test_embed_query_uses_retrieval_query_task(mock_config, mock_embed):
-    embed_query("how does authentication work?")
+    with patch("embeddings.gemini_embedder.get_cache_manager") as mock_cache_factory:
+        mock_cache = MagicMock()
+        mock_cache.get_embedding.return_value = None
+        mock_cache_factory.return_value = mock_cache
+        embed_query("how does authentication work?")
     _, kwargs = mock_embed.call_args
     assert kwargs["task_type"] == TASK_TYPE_QUERY
 
@@ -159,7 +187,11 @@ def test_embed_query_returns_768_dims(mock_config, mock_embed):
 @patch("embeddings.gemini_embedder.genai.embed_content", side_effect=_fake_embed)
 @patch("embeddings.gemini_embedder._configure_genai")
 def test_embed_chunk_uses_document_task(mock_config, mock_embed):
-    embed_chunk(SAMPLE_CHUNK)
+    with patch("embeddings.gemini_embedder.get_cache_manager") as mock_cache_factory:
+        mock_cache = MagicMock()
+        mock_cache.get_embedding.return_value = None
+        mock_cache_factory.return_value = mock_cache
+        embed_chunk(SAMPLE_CHUNK)
     _, kwargs = mock_embed.call_args
     assert kwargs["task_type"] == TASK_TYPE_DOCUMENT
 
@@ -234,7 +266,12 @@ def test_batch_skips_failed_chunks(mock_sleep, mock_config, mock_embed):
          "content": f"def func_{i}(): return {i}\n    pass"}
         for i in range(3)
     ]
-    results = embed_chunks_batch(chunks)
+    with patch("embeddings.gemini_embedder.get_cache_manager") as mock_cache_factory:
+        mock_cache = MagicMock()
+        mock_cache.get_embedding.return_value = None
+        mock_cache_factory.return_value = mock_cache
+        with patch.object(gemini_embedder.settings, "embedding_allow_local_fallback", False):
+            results = embed_chunks_batch(chunks)
 
     # chunk-0 and chunk-2 succeed, chunk-1 is skipped
     assert len(results) == 2

@@ -1,6 +1,10 @@
-from pydantic_settings import BaseSettings
 from functools import lru_cache
-from typing import Literal
+import logging
+from pydantic_settings import BaseSettings
+
+
+class ConfigurationError(Exception):
+    """Raised when a required configuration value is missing or invalid."""
 
 
 class Settings(BaseSettings):
@@ -20,6 +24,7 @@ class Settings(BaseSettings):
     llm_security_model: str = "deepseek-reasoner"
     llm_embedding_model: str = "models/gemini-embedding-001"
     embedding_vector_dim: int = 768
+    embedding_allow_local_fallback: bool = True
     llm_fallback_model: str = "openrouter"
 
     # ── PostgreSQL ────────────────────────────────────────
@@ -88,6 +93,43 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+
+
+def validate_production_config(settings: "Settings") -> None:
+    """
+    Validate required configuration values for production deployment.
+
+    Raises:
+        ConfigurationError: if a required configuration value is missing.
+    """
+    required = {
+        "gemini_api_key": "Gemini text-embedding-004 vector embeddings",
+        "openrouter_api_key": "Qwen LLM via OpenRouter (qwen-2.5-coder-32b-instruct, qwen-max)",
+        "postgres_host": "PostgreSQL metadata database",
+        "postgres_db": "PostgreSQL database name",
+        "postgres_user": "PostgreSQL authentication",
+        "postgres_password": "PostgreSQL authentication",
+        "redis_url": "Celery broker, session store, and caching layer",
+        "qdrant_host": "Qdrant vector database for semantic search",
+        "neo4j_uri": "Neo4j graph database for dependency graphs",
+        "neo4j_user": "Neo4j authentication",
+        "neo4j_password": "Neo4j authentication",
+    }
+
+    for field, description in required.items():
+        value = getattr(settings, field, "")
+        if value is None or (isinstance(value, str) and value.strip() == ""):
+            raise ConfigurationError(
+                f"Required environment variable '{field.upper()}' is not set.\n"
+                f"  This variable is required for: {description}\n"
+                f"  Set it in your .env.prod file and run: make prod-up"
+            )
+
+    if not settings.deepseek_api_key:
+        logging.getLogger(__name__).warning(
+            "DEEPSEEK_API_KEY is not set - DeepSeek direct fallback unavailable. "
+            "OpenRouter (Qwen) remains available as the primary provider."
+        )
 
 
 @lru_cache()

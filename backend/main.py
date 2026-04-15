@@ -1,4 +1,6 @@
+import os
 from fastapi import FastAPI
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from api.routes import analysis, graph, ingest, search
@@ -11,7 +13,7 @@ from api.routes.metrics import router as metrics_router
 from api.routes.providers import router as providers_router
 from api.routes.webhook import router as webhook_router
 from core.logging import setup_logging, get_logger
-from core.config import get_settings
+from core.config import ConfigurationError, get_settings, validate_production_config
 from api.middleware import add_middleware
 from cost_tracking.models import BudgetExceededError
 from graph.neo4j_client import get_driver, close_driver, ping as neo4j_ping
@@ -27,6 +29,15 @@ async def lifespan(app: FastAPI):
     """Application startup and shutdown handler."""
     # ── Startup ────────────────────────────────────────────────────────────
     logger.info("app_startup_begin")
+
+    # Fail early when required production env vars are missing.
+    if os.getenv("APP_ENV", settings.app_env).lower() == "production":
+        try:
+            validate_production_config(settings)
+            logger.info("production_config_valid", env="production")
+        except ConfigurationError as e:
+            logger.error("startup_config_error", error=str(e))
+            raise SystemExit(1) from e
 
     # Validate LLM API keys (existing — logs warnings for missing keys)
 
@@ -52,10 +63,76 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AI Codebase Intelligence Platform",
-    description="Query any GitHub repository using natural language.",
-    version="0.1.0",
+    description=(
+        "Ingest repositories, run semantic search, query with RAG, and inspect dependency graphs. "
+        "The platform routes questions to specialized LLM models and returns grounded answers with citations."
+    ),
+    version="1.0.0",
+    openapi_tags=[
+        {
+            "name": "Ingestion",
+            "description": "Repository ingestion and ingestion-status endpoints.",
+        },
+        {
+            "name": "Query",
+            "description": "Question-answering, provider inspection, and semantic search endpoints.",
+        },
+        {
+            "name": "Graph",
+            "description": "Dependency and call-graph retrieval and traversal endpoints.",
+        },
+        {
+            "name": "Analysis",
+            "description": "Static analysis and evaluation endpoints.",
+        },
+        {
+            "name": "System",
+            "description": "System health and operational endpoints.",
+        },
+    ],
     lifespan=lifespan,
 )
+
+
+def custom_openapi():
+    """Inject Week 16 API metadata into the generated OpenAPI schema."""
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=app.openapi_tags,
+    )
+
+    info = schema.setdefault("info", {})
+    info["contact"] = {
+        "name": "AI Codebase Intelligence Team",
+        "url": "https://github.com/your-username/ai-codebase-intelligence",
+        "email": "maintainers@example.com",
+    }
+    info["license"] = {
+        "name": "MIT",
+        "url": "https://opensource.org/licenses/MIT",
+    }
+    schema["servers"] = [
+        {
+            "url": "http://localhost:8000",
+            "description": "Local development",
+        },
+        {
+            "url": "https://your-app.example.com",
+            "description": "Production",
+        },
+    ]
+
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 add_middleware(app)
 
@@ -87,7 +164,15 @@ async def budget_exceeded_handler(request, exc: BudgetExceededError):
     )
 
 
-@app.get("/health", tags=["system"])
+@app.get(
+    "/health",
+    tags=["System"],
+    summary="System health check",
+    description=(
+        "Returns high-level service health and available LLM providers. "
+        "Use this endpoint for smoke checks and uptime monitoring."
+    ),
+)
 async def health():
     from reasoning.llm_router import get_available_providers
     available = [p.value for p in get_available_providers()]
@@ -103,7 +188,7 @@ async def health():
 
     return JSONResponse({
         "status": "ok",
-        "version": "0.1.0",
+        "version": "1.0.0",
         "llm_providers_available": available,
         "qdrant": {
             "status": qdrant_status,

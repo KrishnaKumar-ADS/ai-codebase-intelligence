@@ -26,8 +26,11 @@ How we build the embedding text for a code chunk:
   This gives the model more context and produces better embeddings.
 """
 
-import time
 import logging
+import hashlib
+import math
+import re
+import time
 import google.generativeai as genai
 from tenacity import (
     retry,
@@ -36,6 +39,7 @@ from tenacity import (
     retry_if_exception,       # ← takes predicate (exception) -> bool
     before_sleep_log,
 )
+from caching.cache_manager import get_cache_manager
 from core.config import get_settings
 from core.logging import get_logger
 from core.exceptions import EmbeddingError
@@ -53,6 +57,20 @@ BATCH_DELAY_SECS    = 0.8     # seconds to sleep between batches
 
 TASK_TYPE_DOCUMENT  = "retrieval_document"  # for indexing code
 TASK_TYPE_QUERY     = "retrieval_query"     # for user search queries
+
+_PROVIDER_FAILURE_HINTS = (
+    "429",
+    "quota",
+    "resourceexhausted",
+    "rate limit",
+    "deadline",
+    "timeout",
+    "timed out",
+    "connection",
+    "unavailable",
+    "api key",
+    "permission denied",
+)
 
 
 # ── Client setup ──────────────────────────────────────────────────────────────
@@ -139,6 +157,48 @@ def _build_embedding_text(chunk: dict) -> str:
     return "\n".join(parts)
 
 
+def _local_hash_embedding(text: str) -> list[float]:
+    """
+    Build a deterministic local embedding when remote provider calls fail.
+
+    This uses feature hashing over tokens, then L2-normalizes the vector.
+    It is not as semantically strong as Gemini embeddings, but keeps the
+    ingestion pipeline operational and queryable in offline/quota-exhausted
+    conditions.
+    """
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\d+|[^\s]", text.lower())
+    vector = [0.0] * VECTOR_DIMENSIONS
+
+    if not tokens:
+        vector[0] = 1.0
+        return vector
+
+    for token in tokens:
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=16).digest()
+        index = int.from_bytes(digest[:4], byteorder="big", signed=False) % VECTOR_DIMENSIONS
+        sign = 1.0 if (digest[4] % 2 == 0) else -1.0
+        magnitude = 0.5 + (digest[5] / 255.0)
+        vector[index] += sign * magnitude
+
+    norm = math.sqrt(sum(v * v for v in vector))
+    if norm == 0.0:
+        vector[0] = 1.0
+        return vector
+
+    return [v / norm for v in vector]
+
+
+def _should_use_local_fallback(exc: Exception) -> bool:
+    """
+    Decide whether provider failures should fall back to local embeddings.
+    """
+    if not settings.embedding_allow_local_fallback:
+        return False
+
+    error_text = str(exc).lower()
+    return any(hint in error_text for hint in _PROVIDER_FAILURE_HINTS)
+
+
 # ── Single embedding functions ────────────────────────────────────────────────
 
 # WHY retry_if_exception(lambda) and NOT retry_if_exception_type(Exception):
@@ -193,27 +253,37 @@ def embed_text(
         EmbeddingError: if the API returns wrong number of dimensions
         tenacity.RetryError: if all retries exhausted on a transient error
     """
-    _configure_genai()
-
     prepared = _prepare_text(text)
     if not prepared:
         raise EmbeddingError("Cannot embed empty or blank text")
 
-    result = genai.embed_content(
-        model=EMBEDDING_MODEL,
-        content=prepared,
-        task_type=task_type,
-        output_dimensionality=VECTOR_DIMENSIONS,
-    )
+    try:
+        _configure_genai()
 
-    vector = result["embedding"]
-
-    if len(vector) != VECTOR_DIMENSIONS:
-        raise EmbeddingError(
-            f"Expected {VECTOR_DIMENSIONS} dimensions, got {len(vector)}"
+        result = genai.embed_content(
+            model=EMBEDDING_MODEL,
+            content=prepared,
+            task_type=task_type,
+            output_dimensionality=VECTOR_DIMENSIONS,
         )
 
-    return vector
+        vector = result["embedding"]
+        if len(vector) != VECTOR_DIMENSIONS:
+            raise EmbeddingError(
+                f"Expected {VECTOR_DIMENSIONS} dimensions, got {len(vector)}"
+            )
+
+        return vector
+    except EmbeddingError as exc:
+        if _should_use_local_fallback(exc):
+            logger.warning("embedding_local_fallback", reason="provider_config", error=str(exc))
+            return _local_hash_embedding(prepared)
+        raise
+    except Exception as exc:
+        if _should_use_local_fallback(exc):
+            logger.warning("embedding_local_fallback", reason="provider_runtime", error=str(exc))
+            return _local_hash_embedding(prepared)
+        raise
 
 
 def embed_query(query: str) -> list[float]:
@@ -230,7 +300,16 @@ def embed_query(query: str) -> list[float]:
     Returns:
         768-dimensional vector ready for Qdrant similarity search
     """
-    return embed_text(query.strip(), task_type=TASK_TYPE_QUERY)
+    normalized = query.strip()
+    cache = get_cache_manager()
+    cached = cache.get_embedding(normalized)
+    if cached is not None:
+        logger.debug("embedding_cache_hit_query", preview=normalized[:60])
+        return cached
+
+    vector = embed_text(normalized, task_type=TASK_TYPE_QUERY)
+    cache.set_embedding(normalized, vector)
+    return vector
 
 
 def embed_chunk(chunk: dict) -> list[float]:
@@ -247,7 +326,15 @@ def embed_chunk(chunk: dict) -> list[float]:
         768-dimensional vector
     """
     text = _build_embedding_text(chunk)
-    return embed_text(text, task_type=TASK_TYPE_DOCUMENT)
+    cache = get_cache_manager()
+    cached = cache.get_embedding(text)
+    if cached is not None:
+        logger.debug("embedding_cache_hit_chunk", chunk_id=chunk.get("id", "unknown"))
+        return cached
+
+    vector = embed_text(text, task_type=TASK_TYPE_DOCUMENT)
+    cache.set_embedding(text, vector)
+    return vector
 
 
 # ── Batch embedding ───────────────────────────────────────────────────────────

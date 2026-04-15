@@ -1,106 +1,136 @@
-"""
-DeepSeek API client.
-DeepSeek uses an OpenAI-compatible API, so we use the openai library
-with a custom base_url pointing to DeepSeek's endpoint.
-"""
+"""DeepSeek async client for code and reasoning tasks."""
 
-from openai import OpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from __future__ import annotations
+
+from typing import AsyncIterator
+
+from openai import APIConnectionError, APIStatusError, AsyncOpenAI, RateLimitError
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
 from core.config import get_settings
-from core.logging import get_logger
 from core.exceptions import LLMProviderError
+from core.logging import get_logger
 
 logger = get_logger(__name__)
 settings = get_settings()
 
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
-# Model aliases → actual DeepSeek model names
-MODEL_MAP = {
-    "deepseek-coder":    "deepseek-coder",        # DeepSeek Coder V2 — code tasks
-    "deepseek-chat":     "deepseek-chat",          # DeepSeek V3 — general chat
-    "deepseek-reasoner": "deepseek-reasoner",      # DeepSeek R1 — deep reasoning
+DEEPSEEK_CODER = "deepseek-coder"
+DEEPSEEK_CHAT = "deepseek-chat"
+DEEPSEEK_REASONER = "deepseek-reasoner"
+DEFAULT_MODEL = DEEPSEEK_CODER
+
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_TEMPERATURE = 0.1
+DEFAULT_MAX_TOKENS = 4096
+
+CONTEXT_WINDOW_TOKENS = {
+    DEEPSEEK_CODER: 128_000,
+    DEEPSEEK_CHAT: 65_536,
+    DEEPSEEK_REASONER: 65_536,
 }
 
 
-def _get_client() -> OpenAI:
-    return OpenAI(
-        api_key=settings.deepseek_api_key,
-        base_url=DEEPSEEK_BASE_URL,
+class DeepSeekClient:
+    """Async DeepSeek chat-completions client with retry support."""
+
+    def __init__(self, model: str = DEFAULT_MODEL) -> None:
+        if not settings.deepseek_api_key:
+            raise LLMProviderError("DEEPSEEK_API_KEY is not set.")
+
+        self._model = model
+        self._client = AsyncOpenAI(
+            api_key=settings.deepseek_api_key,
+            base_url=DEEPSEEK_BASE_URL,
+            timeout=120.0,
+            max_retries=0,
+        )
+
+    async def complete(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        model: str | None = None,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> str:
+        target_model = model or self._model
+        messages = self._build_messages(prompt, system_prompt)
+
+        try:
+            response = await self._complete_with_retry(
+                messages=messages,
+                model=target_model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            text = response.choices[0].message.content or ""
+            return text
+        except LLMProviderError:
+            raise
+        except Exception as exc:
+            logger.error("deepseek_complete_failed", error=str(exc), model=target_model)
+            raise LLMProviderError(f"DeepSeek generation failed: {exc}") from exc
+
+    async def stream_complete(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        model: str | None = None,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> AsyncIterator[str]:
+        target_model = model or self._model
+        messages = self._build_messages(prompt, system_prompt)
+
+        try:
+            stream = await self._client.chat.completions.create(
+                model=target_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+        except (APIStatusError, APIConnectionError, RateLimitError) as exc:
+            raise LLMProviderError(f"DeepSeek streaming failed: {exc}") from exc
+        except Exception as exc:
+            raise LLMProviderError(f"DeepSeek streaming failed: {exc}") from exc
+
+    def get_context_window(self, model: str | None = None) -> int:
+        return CONTEXT_WINDOW_TOKENS.get(model or self._model, 65_536)
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((APIStatusError, APIConnectionError, RateLimitError)),
+        reraise=True,
     )
+    async def _complete_with_retry(
+        self,
+        messages: list[dict],
+        model: str,
+        temperature: float,
+        max_tokens: int,
+    ):
+        return await self._client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
-
-@retry(
-    retry=retry_if_exception_type(Exception),
-    wait=wait_exponential(multiplier=1, min=2, max=30),
-    stop=stop_after_attempt(3),
-)
-def generate(
-    prompt: str,
-    system_prompt: str = "",
-    model: str = "deepseek-coder",
-    max_tokens: int = 4096,
-    temperature: float = 0.1,
-) -> str:
-    """
-    Generate a completion using DeepSeek API.
-    Best models:
-      - deepseek-coder   → code explanation, bug tracing, architecture Q&A
-      - deepseek-chat    → general questions
-      - deepseek-reasoner → security analysis, complex multi-step reasoning
-    """
-    try:
-        client = _get_client()
-        actual_model = MODEL_MAP.get(model, model)
-
+    @staticmethod
+    def _build_messages(prompt: str, system_prompt: str) -> list[dict]:
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
-
-        response = client.chat.completions.create(
-            model=actual_model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stream=False,
-        )
-
-        text = response.choices[0].message.content
-        logger.debug("deepseek_response", model=actual_model, tokens=response.usage.total_tokens)
-        return text
-
-    except Exception as e:
-        logger.error("deepseek_generate_failed", error=str(e), model=model)
-        raise LLMProviderError(f"DeepSeek generation failed: {e}") from e
-
-
-def generate_stream(
-    prompt: str,
-    system_prompt: str = "",
-    model: str = "deepseek-coder",
-    max_tokens: int = 4096,
-):
-    """
-    Streaming version of generate() — yields text chunks.
-    Use for the /ask endpoint with stream=True.
-    """
-    client = _get_client()
-    actual_model = MODEL_MAP.get(model, model)
-
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-
-    stream = client.chat.completions.create(
-        model=actual_model,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=0.1,
-        stream=True,
-    )
-
-    for chunk in stream:
-        if chunk.choices[0].delta.content:
-            yield chunk.choices[0].delta.content
+        return messages

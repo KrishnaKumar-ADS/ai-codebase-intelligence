@@ -181,7 +181,7 @@ async def test_ask_returns_422_when_question_missing(app: FastAPI):
 
 
 @pytest.mark.asyncio
-async def test_ask_returns_503_when_llm_providers_fail(app: FastAPI):
+async def test_ask_returns_fallback_response_when_llm_providers_fail(app: FastAPI):
     repo = SimpleNamespace(
         id="11111111-1111-1111-1111-111111111111",
         name="repo",
@@ -207,4 +207,8 @@ async def test_ask_returns_503_when_llm_providers_fail(app: FastAPI):
                     },
                 )
 
-    assert response.status_code == 503
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider_used"] == "fallback"
+    assert payload["model_used"] == "retrieval-only"
+    assert payload["quality_score"]["skipped"] is True

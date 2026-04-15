@@ -24,9 +24,11 @@ from db.models import Repository, SourceFile, CodeChunk, IngestionStatus
 from ingestion.repo_loader import clone_repository
 from ingestion.file_scanner import scan_repository, ScannedFile
 from parsing.metadata_extractor import extract_metadata
-from graphs.graph_builder import build_repo_graph
-from graphs.neo4j_writer import write_graph_to_neo4j, delete_repo_graph
-from graphs.schema import create_indexes
+from graph.graph_builder import build_repo_graph
+from graph.hierarchy_builder import build_class_hierarchy
+from graph.neo4j_writer import write_graph_to_neo4j, delete_repo_graph
+from graph.schema import create_indexes
+from search.bm25_store import invalidate_index
 from core.config import get_settings
 from core.exceptions import RepoNotFoundError
 
@@ -264,6 +266,7 @@ def run_ingestion_task(self, repo_id: str, github_url: str, branch: str = "main"
         logger.info(f"[{repo_id}] Graph stage start")
 
         graph_stats: dict = {}
+        hierarchy_stats: dict = {}
 
         try:
             # Create Neo4j indexes on first run (idempotent).
@@ -304,6 +307,24 @@ def run_ingestion_task(self, repo_id: str, github_url: str, branch: str = "main"
             )
             # Do NOT return or raise here — fall through to completion.
 
+        # ── Stage 5b: Class hierarchy edges (Week 5) ───────────────────────
+        try:
+            _update_state(self, 97, "Building class hierarchy graph...")
+            with SyncSessionLocal() as sync_db:
+                hierarchy_result = build_class_hierarchy(repo_id=repo_id, db=sync_db)
+            hierarchy_stats = {
+                "classes_processed": hierarchy_result.classes_processed,
+                "inherits_from_edges": hierarchy_result.inherits_from_edges,
+                "implements_edges": hierarchy_result.implements_edges,
+                "mixes_in_edges": hierarchy_result.mixes_in_edges,
+                "classes_updated": hierarchy_result.classes_updated,
+            }
+        except Exception as hierarchy_err:
+            logger.error(
+                f"[{repo_id}] Hierarchy build failed (non-fatal): {hierarchy_err}",
+                exc_info=True,
+            )
+
         # ── Stage 6: Complete ─────────────────────────────────────────────────
         _set_status(
             repo_id,
@@ -312,11 +333,17 @@ def run_ingestion_task(self, repo_id: str, github_url: str, branch: str = "main"
             processed_files=total_files,
         )
 
+        try:
+            invalidate_index(str(repo_id))
+        except Exception:
+            logger.warning(f"[{repo_id}] BM25 index invalidation failed (non-fatal)")
+
         completion_message = (
             f"Done — {total_files} files, "
             f"{total_chunks} chunks, "
             f"{total_embedded} embedded, "
-            f"{graph_stats.get('function_nodes', 0)} functions in graph."
+            f"{graph_stats.get('function_nodes', 0)} functions in graph, "
+            f"{hierarchy_stats.get('classes_processed', 0)} classes in hierarchy."
         )
 
         _update_state(self, 100, completion_message)
@@ -329,6 +356,7 @@ def run_ingestion_task(self, repo_id: str, github_url: str, branch: str = "main"
             "total_chunks":   total_chunks,
             "total_embedded": total_embedded,
             "graph_stats":    graph_stats,
+            "hierarchy_stats": hierarchy_stats,
         }
 
     except RepoNotFoundError as e:
