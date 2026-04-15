@@ -38,7 +38,7 @@ python-multipart==0.0.9
 # ── Code Parsing ──────────────────────────────────────────
 tree-sitter==0.21.3
 tree-sitter-python==0.21.0
-tree-sitter-javascript==0.21.4
+tree-sitter-javascript==0.25.0
 tree-sitter-typescript==0.21.2
 tree-sitter-go==0.21.2
 tree-sitter-java==0.21.0
