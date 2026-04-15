@@ -36,7 +36,7 @@ structlog==24.2.0
 python-multipart==0.0.9
 
 # ── Code Parsing ──────────────────────────────────────────
-tree-sitter==0.21.3
+tree-sitter==0.25.2
 tree-sitter-python==0.21.0
 tree-sitter-javascript==0.21.4
 tree-sitter-typescript==0.21.2
